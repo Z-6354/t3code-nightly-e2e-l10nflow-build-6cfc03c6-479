@@ -1,0 +1,106 @@
+name: L10nFlow Windows installer
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        required: true
+        type: string
+      installer_version:
+        required: true
+        type: string
+      dispatch_id:
+        required: true
+        type: string
+run-name: l10nflow:${{ inputs.candidate_sha }}:${{ inputs.installer_version }}:${{ inputs.dispatch_id }}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      T3CODE_DESKTOP_VERSION: ${{ inputs.installer_version }}
+      L10NFLOW_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Validate locked dispatch inputs
+        shell: pwsh
+        run: |
+          if ($env:L10NFLOW_CANDIDATE_SHA -cnotmatch '\A[0-9a-f]{40}\z') {
+            throw 'Invalid candidate SHA.'
+          }
+          $versionPattern = '\A(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){2}\z'
+          if ($env:T3CODE_DESKTOP_VERSION -cnotmatch $versionPattern) {
+            throw 'Invalid installer version.'
+          }
+          if (($env:T3CODE_DESKTOP_VERSION.Split('.') | Where-Object { [int]$_ -gt 65535 })) {
+            throw 'Installer version exceeds the Windows limit.'
+          }
+      - name: Check out the locked candidate
+        shell: pwsh
+        env:
+          L10NFLOW_CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          $root = Join-Path ([IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)) 'l10n'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          "L10NFLOW_BUILD_ROOT=$root" >> $env:GITHUB_ENV
+          Set-Location -LiteralPath $root
+          git init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config --local core.longpaths true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY.git"
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+          $credential = "x-access-token:$env:L10NFLOW_CHECKOUT_TOKEN"
+          $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($credential))
+          Write-Output "::add-mask::$basic"
+          $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $basic"
+          try {
+            git fetch --depth=1 --no-tags --no-recurse-submodules $url $env:L10NFLOW_CANDIDATE_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate fetch failed.' }
+          } finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0
+            Remove-Item Env:L10NFLOW_CHECKOUT_TOKEN
+          }
+          git checkout --detach --no-recurse-submodules FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((git rev-parse HEAD) -cne $env:L10NFLOW_CANDIDATE_SHA) {
+            throw 'Checked out commit differs from the locked candidate.'
+          }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Install pinned dependencies
+        working-directory: ${{ env.L10NFLOW_BUILD_ROOT }}
+        shell: pwsh
+        run: |
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          corepack pnpm@12.14.0 install --frozen-lockfile
+          exit $LASTEXITCODE
+      - name: Build manual Windows x64 installer
+        working-directory: ${{ env.L10NFLOW_BUILD_ROOT }}
+        shell: pwsh
+        run: |
+          $env:GITHUB_REPOSITORY = $null
+          $env:T3CODE_DESKTOP_UPDATE_REPOSITORY = $null
+          $env:T3CODE_DESKTOP_SIGNED = 'false'
+          $env:T3CODE_DESKTOP_MOCK_UPDATES = 'false'
+          corepack pnpm@12.14.0 run dist:desktop:win:x64
+          exit $LASTEXITCODE
+      - name: Verify installer metadata
+        id: installer
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:L10NFLOW_BUILD_ROOT "release/T3-Code-$env:T3CODE_DESKTOP_VERSION-x64.exe"
+          $file = Get-Item -LiteralPath $path -ErrorAction Stop
+          if ($file.VersionInfo.ProductVersion -ne $env:T3CODE_DESKTOP_VERSION) {
+            throw 'Installer ProductVersion does not match the locked version.'
+          }
+          Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
+          "path=$path" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: l10nflow-windows-x64
+          path: ${{ steps.installer.outputs.path }}
+          if-no-files-found: error
